@@ -27,6 +27,9 @@ on:
         default: "false"
         type: choice
         options: ["true", "false"]
+  # schedule:
+  #   - cron: "0 8 * * *"
+
 # 私有源仓库（代码从这里拉，凭据用 PRIVATE_REPO_TOKEN）
 env:
   SOURCE_REPO: "xbox-cn/grok-reg-test"
@@ -127,6 +130,7 @@ jobs:
   # ── Job 3：收集所有 runner 的账号，合并去重 → 测活 → 存活上传 CPA ──
   collect:
     needs: register
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: 检出私有源仓库代码（含 check_alive.py）
