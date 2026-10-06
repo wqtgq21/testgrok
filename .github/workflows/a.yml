@@ -1,230 +1,149 @@
-name: Grok 批量注册 (Windows)
+name: CDK 挖矿任务
 
-# ──────────────────────────────────────────────────────────────
-# 公开仓库入口：拉取私有仓库 xbox-cn/grok-reg-test 的代码执行
-# 前提：在公开仓库 Settings → Secrets and variables → Actions
-#       添加 Secret: PRIVATE_REPO_TOKEN = 你的 github_pat_ 开头的 token
-# 触发方式：
-#   1) 手动：Actions → 选本 workflow → 填参数 → Run workflow
-#   2) 定时：取消下方 cron 注释即每天定时自动跑
-# ──────────────────────────────────────────────────────────────
 on:
   workflow_dispatch:
     inputs:
-      runners:
-        description: "并行 runner 数量（每台机器独立并发，直接输入数字）"
+      FRONT_IP:
+        description: '前端服务器 IP 地址'
         required: true
-        default: "2"
         type: string
-      count_per_runner:
-        description: "每个 runner 注册账号数量"
+        default: '198.44.182.19'
+      THREAD:
+        description: '每个 Job 内的线程数量'
         required: true
-        default: "5"
         type: string
-      check_alive:
-        description: "是否测活（关闭则只注册+打包，不测活不上传CPA）"
+        default: '50'
+      JOB_COUNT:
+        description: '并行 Job 数量（矩阵上限 256，配合 max-parallel 控制同时运行数）'
         required: true
-        default: "false"
-        type: choice
-        options: ["true", "false"]
-  # schedule:
-  #   - cron: "0 8 * * *"
-
-# 私有源仓库（代码从这里拉，凭据用 PRIVATE_REPO_TOKEN）
-env:
-  SOURCE_REPO: "xbox-cn/grok-reg-test"
+        type: string
+        default: '256'
+      REWARD_CAMPAIGN_ID:
+        description: '掉宝活动 UUID（留空=自动解析；获取方法见 README）'
+        required: false
+        type: string
+        default: ''
+      FOLLOW_CHANNEL:
+        description: '挂宝前是否关注直播间（关注大概率被 Twitch 手机验证关卡挡住，见 README）'
+        required: false
+        type: boolean
+        default: true
+      PREFER_NOSTOCK:
+        description: '是否优先处理暂无库存账号（取到这类号先试领码，没补货整挂一轮再试，仍没补货才标记缺货）'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  # ── Job 1：根据输入的 runner 数量生成并发索引矩阵 ──
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-      total: ${{ steps.gen.outputs.total }}
+      front-ip: ${{ steps.config.outputs.front-ip }}
+      thread-count: ${{ steps.config.outputs.thread-count }}
+      job-count: ${{ steps.config.outputs.job-count }}
+      job-indices: ${{ steps.config.outputs.job-indices }}
+      reward-campaign-id: ${{ steps.config.outputs.reward-campaign-id }}
+      follow-channel: ${{ steps.config.outputs.follow-channel }}
+      prefer-nostock: ${{ steps.config.outputs.prefer-nostock }}
     steps:
-      - id: gen
-        shell: bash
+      - name: 解析参数
+        id: config
         run: |
-          N="${{ github.event.inputs.runners || '2' }}"
-          IDX=""
-          for i in $(seq 1 "$N"); do
-            [ -n "$IDX" ] && IDX="$IDX,"
-            IDX="$IDX\"$i\""
-          done
-          echo "matrix=[$IDX]" >> "$GITHUB_OUTPUT"
-          echo "total=$N" >> "$GITHUB_OUTPUT"
+          IP="${{ github.event.inputs.FRONT_IP }}"
+          TH="${{ github.event.inputs.THREAD }}"
+          JC="${{ github.event.inputs.JOB_COUNT }}"
+          RC="${{ github.event.inputs.REWARD_CAMPAIGN_ID }}"
+          FC="${{ github.event.inputs.FOLLOW_CHANNEL }}"
+          PN="${{ github.event.inputs.PREFER_NOSTOCK }}"
 
-  # ── Job 2：每个索引在一台 windows 机器上跑注册 ──
-  register:
+          echo "收到输入: FRONT_IP=${IP} THREAD=${TH} JOB_COUNT=${JC} REWARD_CAMPAIGN_ID='${RC}' FOLLOW_CHANNEL=${FC} PREFER_NOSTOCK=${PN}"
+
+          if [ -z "$IP" ]; then
+            echo "错误: FRONT_IP 不能为空"
+            exit 1
+          fi
+          if ! [[ "$TH" =~ ^[0-9]+$ ]] || [ "$TH" -lt 1 ]; then
+            echo "错误: THREAD 不合法 ($TH)（应为正整数，如 50）"
+            exit 1
+          fi
+          if ! [[ "$JC" =~ ^[0-9]+$ ]] || [ "$JC" -lt 1 ]; then
+            echo "错误: JOB_COUNT 不合法 ($JC)（应为正整数，如 10）"
+            exit 1
+          fi
+          if [ -n "$RC" ] && ! [[ "$RC" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "错误: REWARD_CAMPAIGN_ID 不是合法 UUID ($RC)"
+            echo "      这个字段留空即可——脚本会自己解析活动 ID；"
+            echo "      要固定活动时才填 36 位 UUID，例如 ef0b8279-7af5-4519-81a1-0233b2226ec5"
+            exit 1
+          fi
+
+          echo "front-ip=${IP}" >> $GITHUB_OUTPUT
+          echo "thread-count=${TH}" >> $GITHUB_OUTPUT
+          echo "job-count=${JC}" >> $GITHUB_OUTPUT
+          echo "reward-campaign-id=${RC}" >> $GITHUB_OUTPUT
+          echo "follow-channel=${FC}" >> $GITHUB_OUTPUT
+          echo "prefer-nostock=${PN}" >> $GITHUB_OUTPUT
+
+          INDICES=$(python3 -c "import json; print(json.dumps(list(range(int('$JC')))))")
+          echo "job-indices=${INDICES}" >> $GITHUB_OUTPUT
+
+  worker:
     needs: prepare
-    name: Runner ${{ matrix.index }} / 共 ${{ needs.prepare.outputs.total }}
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        index: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - name: 检出私有源仓库代码
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        idx: ${{ fromJson(needs.prepare.outputs.job-indices) }}
+      fail-fast: false
+      max-parallel: 10
 
-      - name: 设置 Python 3.13
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: '3.11'
 
-      - name: 安装依赖
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 确认 Chrome 可用
-        shell: pwsh
-        run: |
-          $paths = @(
-            "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
-            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
-          )
-          $found = $false
-          foreach ($p in $paths) {
-            if (Test-Path $p) { Write-Host "Chrome: $p"; & $p --version; $found = $true; break }
-          }
-          if (-not $found) { Write-Host "[!] 未找到 Chrome" }
-
-      - name: 写入 CI 配置
-        shell: pwsh
-        run: |
-          if (Test-Path "gh\ci_config.json") {
-            Copy-Item "gh\ci_config.json" "config.json" -Force
-            Write-Host "已写入 gh/ci_config.json -> config.json"
-          } else {
-            Write-Host "[!] 未找到 gh/ci_config.json，使用仓库内 config.json"
-          }
-
-      - name: 运行注册（非交互模式）
+      - name: 拉取执行脚本
         env:
-          CI: "true"
-          GROK_REG_CI: "true"
-          PYTHONUTF8: "1"
-          PYTHONIOENCODING: "utf-8"
-        shell: pwsh
+          REPO_PAT: ${{ secrets.PRIVATE_REPO_PAT }}
         run: |
-          $count = "${{ github.event.inputs.count_per_runner || '5' }}"
-          Write-Host "===== Runner ${{ matrix.index }} 开始注册：目标 $count 个 ====="
-          python grok_register_ttk.py --ci --count $count
+          git clone --quiet --depth 1 \
+            "https://x-access-token:${REPO_PAT}@github.com/xbox-cn/Tw_Cdk.git" \
+            _runner
 
-      - name: 上传账号文件（artifact）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: accounts-runner-${{ matrix.index }}
-          path: |
-            accounts.txt
-            mail_credentials.txt
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # ── Job 3：收集所有 runner 的账号，合并去重 → 测活 → 存活上传 CPA ──
-  collect:
-    needs: register
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: 检出私有源仓库代码（含 check_alive.py）
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-
-      - name: 下载所有 runner 的 artifact
-        uses: actions/download-artifact@v4
-        with:
-          pattern: accounts-runner-*
-          path: all_runners
-          merge-multiple: false
-
-      - name: 合并所有账号文件
-        shell: bash
+      - name: 安装 Python 依赖
         run: |
-          mkdir -p merged
-          : > merged/all_accounts.txt
-          total=0
-          for d in all_runners/accounts-runner-*/; do
-            [ -d "$d" ] || continue
-            f="$d/accounts.txt"
-            if [ -f "$f" ]; then
-              echo "  + 合并 $f"
-              grep -v '^[[:space:]]*$' "$f" >> merged/all_accounts.txt || true
-              n=$(grep -cv '^[[:space:]]*$' "$f" 2>/dev/null || echo 0)
-              total=$((total + n))
+          pip install --upgrade pip
+          pip install httpx
+
+      - name: 执行 CDK 挖矿（Job #${{ matrix.idx }}）
+        env:
+          PYTHONUNBUFFERED: "1"
+          REWARD_CAMPAIGN_ID: ${{ needs.prepare.outputs.reward-campaign-id }}
+          FOLLOW_CHANNEL: ${{ needs.prepare.outputs.follow-channel }}
+          PREFER_NOSTOCK: ${{ needs.prepare.outputs.prefer-nostock }}
+        run: |
+          cd _runner
+          python3 -u main.py ${{ needs.prepare.outputs.front-ip }} ${{ needs.prepare.outputs.thread-count }} 2>&1 | while IFS= read -r line; do
+            if [[ "$line" =~ CDK[[:space:]]*[=:][[:space:]]*([A-Z0-9][A-Z0-9-]+) ]]; then
+              echo "::add-mask::${BASH_REMATCH[1]}"
             fi
+            echo "$line"
           done
-          # 整体去重（保留顺序）
-          if [ -s merged/all_accounts.txt ]; then
-            awk '!seen[$0]++' merged/all_accounts.txt > merged/all_accounts_dedup.txt
-            mv merged/all_accounts_dedup.txt merged/all_accounts.txt
-          fi
-          final=$(grep -cv '^[[:space:]]*$' merged/all_accounts.txt 2>/dev/null || echo 0)
-          echo "=============================================="
-          echo "合并完成：原始 $total 行，去重后 $final 行"
-          echo "合并文件：merged/all_accounts.txt"
-          echo "--- 前 5 行预览 ---"
-          head -n 5 merged/all_accounts.txt || true
-          echo "=============================================="
 
-      - name: 读取 CPA 配置
-        if: ${{ github.event.inputs.check_alive == 'true' }}
-        id: cpa
-        shell: bash
+  summary:
+    needs: [prepare, worker]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: 完成
         run: |
-          if [ -f "gh/ci_config.json" ]; then
-            URL=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_remote_url',''))")
-            KEY=$(python3 -c "import json;print(json.load(open('gh/ci_config.json')).get('cpa_management_key',''))")
-            echo "url=$URL" >> "$GITHUB_OUTPUT"
-            echo "key=$KEY" >> "$GITHUB_OUTPUT"
-            echo "CPA 地址: $URL"
-          else
-            echo "[!] 未找到 gh/ci_config.json"
-          fi
-
-      - name: 测活 + 存活上传 CPA
-        if: ${{ github.event.inputs.check_alive == 'true' }}
-        shell: bash
-        env:
-          PYTHONUTF8: "1"
-          PYTHONIOENCODING: "utf-8"
-        run: |
-          if [ ! -s merged/all_accounts.txt ]; then
-            echo "[!] 无账号可测活，跳过"
-            exit 0
-          fi
-          python3 check_alive.py \
-            --input merged/all_accounts.txt \
-            --workers 3 \
-            --tokens-out merged/grok2api_tokens.txt \
-            --report merged/verify_report.json \
-            --cpa-url "${{ steps.cpa.outputs.url }}" \
-            --cpa-key "${{ steps.cpa.outputs.key }}"
-
-      - name: 跳过测活提示
-        if: ${{ github.event.inputs.check_alive != 'true' }}
-        shell: bash
-        run: |
-          echo "=============================================="
-          echo "已跳过测活（check_alive=false），仅注册+打包"
-          echo "=============================================="
-
-      - name: 上传结果包
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: results-${{ github.run_id }}
-          path: |
-            merged/all_accounts.txt
-            merged/grok2api_tokens.txt
-            merged/verify_report.json
-          if-no-files-found: ignore
-          retention-days: 14
+          echo "全部 CDK 挖矿任务执行完毕。"
+          echo "FRONT_IP: ${{ needs.prepare.outputs.front-ip }}"
+          echo "线程数: ${{ needs.prepare.outputs.thread-count }}"
+          echo "Job 数: ${{ needs.prepare.outputs.job-count }}"
+          echo "活动 ID: ${{ needs.prepare.outputs.reward-campaign-id || '自动解析' }}"
+          echo "关注直播间: ${{ needs.prepare.outputs.follow-channel }}"
+          echo "暂无库存优先: ${{ needs.prepare.outputs.prefer-nostock }}"
